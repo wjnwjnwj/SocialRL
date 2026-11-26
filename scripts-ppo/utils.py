@@ -966,11 +966,20 @@ def score_subgoal_progress_item(
 
         extra = {
             "reward_kind": "rubric_dynamic",
+            "rubric_pipeline": "generate_then_score",
             "actor_role": actor_role,
             "family": family,
             "phase": phase,
             "dim_scores": {k: float(v) for k, v in dim_scores.items()},
+            "rubric_items": {
+                dim: [
+                    {"item_id": item["item_id"], "criterion": item["criterion"]}
+                    for item in items
+                ]
+                for dim, items in rubrics.items()
+            },
             "rubrics": rubrics,
+            "judge_reason": str(reason or ""),
             "baseline_weights": {k: float(v) for k, v in baseline_w.items()},
             "weights": {k: float(v) for k, v in used_w.items()},
             "weighted_score": float(weighted),

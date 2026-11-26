@@ -66,7 +66,7 @@ KL_BETA=0.02                 # 0 关闭，>0 开启 PPO ref-KL penalty (k3 estim
 #   "approval"        = partner 视角认可度 (默认 / 原 third-save 设置)
 #   "goal_directed"   = 第三方视角 goal 推进度 (third-new-para 实验)
 #   "multi_dim_dynamic" = 13 LLM 维度 + 动态/预设权重
-#   "rubric_dynamic" = 6 个正交维度，每 turn 生成二元 rubric 条目后聚合奖励
+#   "rubric_dynamic" = 6 个正交维度，每 turn 先生成 rubric，再独立调用评分并聚合奖励
 PROCESS_REWARD_KIND=rubric_dynamic
 # 仅 dynamic/rubric 过程奖励用到：
 #   TRAJECTORY_NORMALIZE=1  把每 turn 的 process reward 除以 EXPECTED_HORIZON，
@@ -300,5 +300,5 @@ python -m torch.distributed.run \
   --nproc_per_node "${PROC_NUM}" \
   --master_addr "${MASTER_ADDR}" \
   --master_port "${MASTER_PORT}" \
-  scripts-ppo-third-dynamic-reward-rubric/rl_qwen_origin_new_prompt_ddp.py \
+  scripts-ppo/rl_qwen_origin_new_prompt_ddp.py \
   "${COMMON_ARGS[@]}" 2>&1 | tee "${ROOT_DIR}/logs/train_ddp_$(date +%Y%m%d_%H%M%S).log"

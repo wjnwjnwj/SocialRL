@@ -489,15 +489,14 @@ Generate "weight_reasoning" FIRST (1-2 sentences explaining why you adjusted wei
 """
 
 
-rubric_dynamic_judge_prompt = """
+rubric_dynamic_generation_prompt = """
 # Role
-You are a Rubric-Generating Social Dialogue Auditor. Given the scenario, both characters' profiles, the evaluated character's social goal, the dialogue history, and the evaluated character's current reply, you have THREE jobs in ONE call:
+You are a Social Dialogue Rubric Designer. Given the scenario, both characters' profiles, the evaluated character's social goal, and the dialogue history BEFORE their next reply, design the evaluation criteria for that upcoming turn.
 
 1. Generate turn-specific binary rubric items for six orthogonal dimensions.
-2. Judge whether each rubric item passes (1) or fails (0) for the current reply.
-3. Decide dimension weights for this turn, starting from the provided baseline prior.
+2. Decide dimension weights for this turn, starting from the provided baseline prior.
 
-The reply is judged as the evaluated character's CURRENT turn only. Be specific to the current scene, social goal, dialogue phase, and prior history. Do not use generic stock criteria.
+The reply to be evaluated is deliberately NOT provided. Base criteria and weights only on the scene, social goal, dialogue phase, and prior history. Do not invent a reply, judge the last historical reply, or output passed values, scores, or scoring reasons.
 
 # Six Dimensions
 
@@ -522,15 +521,13 @@ The reply is judged as the evaluated character's CURRENT turn only. Be specific 
 # Rubric Generation Rules
 
 For EACH dimension, generate 2 to 4 binary rubric items that are tailored to THIS turn.
-Each item must be answerable as pass/fail for the current reply.
+Each item must be answerable as pass/fail when the upcoming reply becomes available.
 Avoid vague items like "is good" or "is appropriate". Make each criterion concrete and scene-specific.
 
-Each rubric item must contain:
-- "criterion": a concrete pass/fail statement for this turn.
-- "passed": integer 1 or 0 only.
-- "reason": one concise evidence-based sentence.
+Each rubric item must contain ONLY "criterion": a concrete pass/fail statement for this turn.
+Criteria within a dimension must be distinct and allow different valid ways to respond.
 
-The dimension score will be computed by the system as the mean of that dimension's passed values, so do NOT output separate dimension scores.
+A separate scoring call will evaluate the fixed criteria against the reply.
 
 # Weight Reasoning Rules
 
@@ -548,7 +545,7 @@ Constraints:
 
 # Output Format
 Output ONLY a valid JSON object. No markdown, no preamble.
-Generate keys in this order: "weight_reasoning", "weights", "judge_reason", "rubrics".
+Generate keys in this order: "weight_reasoning", "weights", "rubrics".
 
 {{
     "weight_reasoning": "Brief explanation of which dimensions matter most for THIS turn and why.",
@@ -560,25 +557,73 @@ Generate keys in this order: "weight_reasoning", "weights", "judge_reason", "rub
         "contextual_coherence": float,
         "turn_quality": float
     }},
-    "judge_reason": "Brief overall assessment of the reply and the generated rubrics.",
     "rubrics": {{
         "goal_advancement": [
-            {{"criterion": "Concrete pass/fail criterion tailored to this turn.", "passed": 1, "reason": "Evidence-based sentence."}}
+            {{"criterion": "First concrete goal-advancement criterion for the upcoming turn."}},
+            {{"criterion": "Second distinct goal-advancement criterion for the upcoming turn."}}
         ],
         "strategic_positioning": [
-            {{"criterion": "Concrete pass/fail criterion tailored to this turn.", "passed": 0, "reason": "Evidence-based sentence."}}
+            {{"criterion": "First concrete strategy criterion for the upcoming turn."}},
+            {{"criterion": "Second distinct strategy criterion for the upcoming turn."}}
         ],
         "relational_attunement": [
-            {{"criterion": "Concrete pass/fail criterion tailored to this turn.", "passed": 1, "reason": "Evidence-based sentence."}}
+            {{"criterion": "First concrete relational criterion for the upcoming turn."}},
+            {{"criterion": "Second distinct relational criterion for the upcoming turn."}}
         ],
         "persona_consistency": [
-            {{"criterion": "Concrete pass/fail criterion tailored to this turn.", "passed": 1, "reason": "Evidence-based sentence."}}
+            {{"criterion": "First concrete persona criterion for the upcoming turn."}},
+            {{"criterion": "Second distinct persona criterion for the upcoming turn."}}
         ],
         "contextual_coherence": [
-            {{"criterion": "Concrete pass/fail criterion tailored to this turn.", "passed": 1, "reason": "Evidence-based sentence."}}
+            {{"criterion": "First concrete coherence criterion for the upcoming turn."}},
+            {{"criterion": "Second distinct coherence criterion for the upcoming turn."}}
         ],
         "turn_quality": [
-            {{"criterion": "Concrete pass/fail criterion tailored to this turn.", "passed": 0, "reason": "Evidence-based sentence."}}
+            {{"criterion": "First concrete turn-quality criterion for the upcoming turn."}},
+            {{"criterion": "Second distinct turn-quality criterion for the upcoming turn."}}
+        ]
+    }}
+}}
+
+# Input Data
+## Scenario:
+{scenario}
+## Evaluated Character:
+{agent_name}
+## Evaluated Character Profile:
+{agent_background}
+## Evaluated Character Social Goal:
+{agent_goal}
+## Counterpart Character:
+{counterpart_name}
+## Counterpart Character Profile:
+{counterpart_background}
+## Dialogue History Before Current Reply:
+{history}
+## Baseline Weight Prior (for your reference; you may adjust):
+{baseline_weights}
+"""
+
+
+rubric_dynamic_scoring_prompt = """
+# Role
+You are a Rubric-Based Social Dialogue Auditor. Evaluate ONLY the current reply against the fixed rubric items supplied below, using the scenario, character profiles, social goal, and prior dialogue as context.
+
+# Scoring Rules
+- The rubric was generated independently before seeing the current reply. Do not create, rewrite, add, or remove criteria, and do not decide dimension weights.
+- Return exactly one judgement for EVERY supplied item, grouped by its original dimension. Copy its item_id exactly. Do not invent item IDs.
+- "passed" must be integer 1 if the current reply satisfies the criterion, otherwise integer 0. Do not output fractional or dimension scores.
+- "reason" must be one concise sentence citing evidence from the current reply and relevant prior context. Do not credit earlier replies as if they were the current reply, or assume future dialogue outcomes.
+- The system computes each dimension's score as the mean of its binary judgements and applies the previously chosen weights.
+
+# Output Format
+Output ONLY a valid JSON object. No markdown, no preamble.
+The example below illustrates one item; include every supplied item in your actual output.
+{{
+    "judge_reason": "Brief overall assessment of the current reply against the fixed criteria.",
+    "judgements": {{
+        "goal_advancement": [
+            {{"item_id": "goal_advancement_1", "passed": 1, "reason": "Evidence-based sentence."}}
         ]
     }}
 }}
@@ -600,8 +645,8 @@ Generate keys in this order: "weight_reasoning", "weights", "judge_reason", "rub
 {history}
 ## Current Reply From Evaluated Character:
 {response}
-## Baseline Weight Prior (for your reference; you may adjust):
-{baseline_weights}
+## Fixed Rubric Items:
+{rubric_items}
 """
 
 

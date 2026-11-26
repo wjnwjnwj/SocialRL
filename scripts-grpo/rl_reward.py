@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import Dict, List, Optional
 
+from dynamic_reward_config import RUBRIC_DIMENSIONS
 from prompt import (
     goal_achieve_prompt,
     goal_achieve_prompt_continuous,
-    rubric_dynamic_judge_prompt,
+    rubric_dynamic_generation_prompt,
+    rubric_dynamic_scoring_prompt,
 )
 
 from utils import call_api_model
@@ -281,38 +284,14 @@ def _render_goal_text(goal_value: object) -> str:
     return text or "(No goal provided)"
 
 
-def evaluate_rubric_dynamic_with_reason(
+def _rubric_prompt_context(
     scene: dict,
     history_messages: List[Dict[str, str]],
     agent_name: str,
-    current_response: str,
-    ranker_model: str,
-    temperature: float = 0.0,
-    base_url: Optional[str] = None,
-    api_key: Optional[str] = None,
-    baseline_weights_text: str = "",
-) -> tuple:
-    """Per-turn rubric-generated dynamic judgement.
-
-    The judge generates 2-4 binary rubric items per high-level dimension and
-    optional dynamic weights. Each dimension's score = mean(passed values) in [0,1].
-
-    Returns (dim_scores, rubrics, judge_reason, llm_weights, weight_reasoning).
-    """
-    DIMS = (
-        "goal_advancement",
-        "strategic_positioning",
-        "relational_attunement",
-        "persona_consistency",
-        "contextual_coherence",
-        "turn_quality",
-    )
-    default_scores = {d: 0.5 for d in DIMS}
-    default_rubrics = {d: [] for d in DIMS}
-
+) -> Dict[str, str]:
+    """Build context from history BEFORE the current reply for both stages."""
     agents_bg = scene.get("agents_background") or {}
     social_goals = scene.get("social_goals") or {}
-    scenario = scene.get("scenario", "")
     counterpart_name = "User"
     if isinstance(agents_bg, dict):
         for name in agents_bg.keys():
@@ -321,42 +300,25 @@ def evaluate_rubric_dynamic_with_reason(
                 counterpart_name = name_str
                 break
 
-    response_text = str(current_response or "").strip()
-    if not response_text:
-        return (
-            default_scores,
-            default_rubrics,
-            "No actor reply available for rubric judgement.",
-            None,
-            "",
-        )
-
     history_text = render_dialogue_for_lang_reward(
         history_messages or [], other_speaker_name=counterpart_name
     )
-    user_prompt = rubric_dynamic_judge_prompt.format(
-        scenario=str(scenario or "(No scenario provided)"),
-        agent_name=agent_name,
-        agent_background=str(agents_bg.get(agent_name, "") or "(No profile provided)"),
-        agent_goal=_render_goal_text(social_goals.get(agent_name, "")),
-        counterpart_name=counterpart_name,
-        counterpart_background=str(
+    return {
+        "scenario": str(scene.get("scenario") or "(No scenario provided)"),
+        "agent_name": agent_name,
+        "agent_background": str(agents_bg.get(agent_name) or "(No profile provided)"),
+        "agent_goal": _render_goal_text(social_goals.get(agent_name, "")),
+        "counterpart_name": counterpart_name,
+        "counterpart_background": str(
             agents_bg.get(counterpart_name, "") or "(No profile provided)"
         ),
-        history=history_text or "(No dialogue history)",
-        response=response_text,
-        baseline_weights=str(baseline_weights_text or "(no baseline provided)"),
-    )
-    resp = call_api_model(
-        messages=[{"role": "user", "content": user_prompt}],
-        model=ranker_model,
-        temperature=temperature,
-        base_url=base_url,
-        api_key=api_key,
-    )
-    if not resp:
-        return default_scores, default_rubrics, "", None, ""
+        "history": history_text or "(No dialogue history)",
+    }
 
+
+def _parse_rubric_response(resp: Optional[str]) -> dict:
+    if not resp:
+        return {}
     cleaned = resp.strip()
     if cleaned.startswith("```json"):
         cleaned = cleaned[7:]
@@ -368,61 +330,209 @@ def evaluate_rubric_dynamic_with_reason(
 
     try:
         parsed = json.loads(cleaned)
-        if not isinstance(parsed, dict):
-            return default_scores, default_rubrics, "", None, ""
-
-        weight_reasoning = str(parsed.get("weight_reasoning") or "").strip()
-        judge_reason = str(
-            parsed.get("judge_reason") or parsed.get("reason") or parsed.get("analysis") or ""
-        ).strip()
-
-        out_rubrics: Dict[str, list] = {d: [] for d in DIMS}
-        out_scores: Dict[str, float] = dict(default_scores)
-        rubrics_raw = parsed.get("rubrics")
-        if isinstance(rubrics_raw, dict):
-            for dim in DIMS:
-                items = rubrics_raw.get(dim)
-                if not isinstance(items, list):
-                    continue
-                cleaned_items = []
-                passed_values: List[float] = []
-                for item in items[:4]:
-                    if not isinstance(item, dict):
-                        continue
-                    criterion = str(item.get("criterion") or "").strip()
-                    reason = str(item.get("reason") or "").strip()
-                    raw_passed = item.get("passed")
-                    if isinstance(raw_passed, bool):
-                        passed = 1 if raw_passed else 0
-                    else:
-                        try:
-                            passed = 1 if int(float(raw_passed)) >= 1 else 0
-                        except (TypeError, ValueError):
-                            continue
-                    cleaned_items.append(
-                        {"criterion": criterion, "passed": int(passed), "reason": reason}
-                    )
-                    passed_values.append(float(passed))
-                if cleaned_items:
-                    out_rubrics[dim] = cleaned_items
-                    out_scores[dim] = float(sum(passed_values) / len(passed_values))
-
-        llm_weights: Optional[Dict[str, float]] = None
-        ws = parsed.get("weights")
-        if isinstance(ws, dict):
-            cand: Dict[str, float] = {}
-            for d in DIMS:
-                v = ws.get(d)
-                if v is None:
-                    continue
-                try:
-                    cand[d] = float(v)
-                except (TypeError, ValueError):
-                    continue
-            if cand:
-                llm_weights = cand
-        return out_scores, out_rubrics, judge_reason, llm_weights, weight_reasoning
+        return parsed if isinstance(parsed, dict) else {}
     except (json.JSONDecodeError, ValueError, TypeError):
-        pass
+        return {}
 
-    return default_scores, default_rubrics, "", None, ""
+
+def generate_rubric_dynamic(
+    scene: dict,
+    history_messages: List[Dict[str, str]],
+    agent_name: str,
+    ranker_model: str,
+    temperature: float = 0.0,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    baseline_weights_text: str = "",
+) -> tuple:
+    """Generate criteria and weights without access to the current reply.
+
+    Returns (rubric_items, llm_weights, weight_reasoning). Items contain only
+    system-assigned item_id and criterion; invalid dimensions have no items.
+    """
+    user_prompt = rubric_dynamic_generation_prompt.format(
+        **_rubric_prompt_context(scene, history_messages, agent_name),
+        baseline_weights=str(baseline_weights_text or "(no baseline provided)"),
+    )
+    resp = call_api_model(
+        messages=[{"role": "user", "content": user_prompt}],
+        model=ranker_model,
+        temperature=temperature,
+        base_url=base_url,
+        api_key=api_key,
+    )
+    parsed = _parse_rubric_response(resp)
+    rubrics = {d: [] for d in RUBRIC_DIMENSIONS}
+    raw_rubrics = parsed.get("rubrics")
+    if isinstance(raw_rubrics, dict):
+        for dim in RUBRIC_DIMENSIONS:
+            items = raw_rubrics.get(dim)
+            if not isinstance(items, list) or not 2 <= len(items) <= 4:
+                continue
+            criteria = [
+                item.get("criterion") if isinstance(item, dict) else None
+                for item in items
+            ]
+            if any(not isinstance(c, str) or not c.strip() for c in criteria):
+                continue
+            criteria = [c.strip() for c in criteria]
+            if len(set(criteria)) != len(criteria):
+                continue
+            # Ignore any scores, reasons, or IDs leaked by the generator.
+            rubrics[dim] = [
+                {"item_id": f"{dim}_{idx}", "criterion": criterion}
+                for idx, criterion in enumerate(criteria, start=1)
+            ]
+
+    weights: Dict[str, float] = {}
+    raw_weights = parsed.get("weights")
+    if isinstance(raw_weights, dict):
+        for dim in RUBRIC_DIMENSIONS:
+            try:
+                value = float(raw_weights.get(dim))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(value):
+                weights[dim] = value
+    return rubrics, weights or None, str(parsed.get("weight_reasoning") or "").strip()
+
+
+def score_rubric_dynamic_with_reason(
+    scene: dict,
+    history_messages: List[Dict[str, str]],
+    agent_name: str,
+    current_response: str,
+    rubric_items: Dict[str, list],
+    ranker_model: str,
+    temperature: float = 0.0,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> tuple:
+    """Score fixed items returned by generate_rubric_dynamic in a fresh call.
+
+    Returns (dim_scores, scored_rubrics, judge_reason). Criteria are copied from
+    generation, never from the scorer. A dimension with incomplete/invalid
+    judgements retains the neutral 0.5 fallback, with unscored items marked None.
+    """
+    fixed_items = {
+        dim: [
+            {"item_id": item["item_id"], "criterion": item["criterion"]}
+            for item in rubric_items.get(dim, [])
+        ]
+        for dim in RUBRIC_DIMENSIONS
+    }
+    scores = {d: 0.5 for d in RUBRIC_DIMENSIONS}
+    scored_rubrics = {
+        dim: [dict(item, passed=None, reason="No valid judgement returned.") for item in items]
+        for dim, items in fixed_items.items()
+    }
+    response_text = str(current_response or "").strip()
+    if not response_text:
+        return scores, scored_rubrics, "No actor reply available for rubric judgement."
+    if not any(fixed_items.values()):
+        return scores, scored_rubrics, "Rubric generation failed: no valid criteria returned."
+
+    user_prompt = rubric_dynamic_scoring_prompt.format(
+        **_rubric_prompt_context(scene, history_messages, agent_name),
+        response=response_text,
+        rubric_items=json.dumps(fixed_items, ensure_ascii=False),
+    )
+    resp = call_api_model(
+        messages=[{"role": "user", "content": user_prompt}],
+        model=ranker_model,
+        temperature=temperature,
+        base_url=base_url,
+        api_key=api_key,
+    )
+    parsed = _parse_rubric_response(resp)
+    judgements = parsed.get("judgements")
+    if not isinstance(judgements, dict):
+        return scores, scored_rubrics, "Rubric scoring failed: no valid judgements returned."
+
+    invalid_dims = []
+    for dim, items in scored_rubrics.items():
+        raw_items = judgements.get(dim)
+        by_id = {}
+        duplicate_ids = set()
+        if isinstance(raw_items, list):
+            for item in raw_items:
+                if not isinstance(item, dict) or not isinstance(item.get("item_id"), str):
+                    continue
+                item_id = item["item_id"]
+                if item_id in by_id:
+                    duplicate_ids.add(item_id)
+                by_id[item_id] = item
+        for item in items:
+            item_id = item["item_id"]
+            judgement = by_id.get(item_id)
+            if judgement is None or item_id in duplicate_ids:
+                continue
+            try:
+                passed = float(judgement.get("passed"))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if passed not in (0.0, 1.0):
+                continue
+            item["passed"] = int(passed)
+            item["reason"] = str(judgement.get("reason") or "").strip()
+        if items and all(item["passed"] is not None for item in items):
+            scores[dim] = sum(item["passed"] for item in items) / len(items)
+        else:
+            invalid_dims.append(dim)
+
+    reason = str(parsed.get("judge_reason") or parsed.get("reason") or "").strip()
+    if invalid_dims:
+        fallback_reason = (
+            "Neutral fallback for missing/invalid rubric judgements: "
+            + ", ".join(invalid_dims)
+        )
+        reason = f"{reason}\n{fallback_reason}".strip()
+    return scores, scored_rubrics, reason
+
+
+def evaluate_rubric_dynamic_with_reason(
+    scene: dict,
+    history_messages: List[Dict[str, str]],
+    agent_name: str,
+    current_response: str,
+    ranker_model: str,
+    temperature: float = 0.0,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    baseline_weights_text: str = "",
+) -> tuple:
+    """Generate reply-independent rubrics, then score the reply in a second call.
+
+    Returns (dim_scores, scored_rubrics, judge_reason, llm_weights, weight_reasoning).
+    Both stages use the configured reward endpoint; weights come only from generation.
+    """
+    if not str(current_response or "").strip():
+        return (
+            {d: 0.5 for d in RUBRIC_DIMENSIONS},
+            {d: [] for d in RUBRIC_DIMENSIONS},
+            "No actor reply available for rubric judgement.",
+            None,
+            "",
+        )
+    rubrics, llm_weights, weight_reasoning = generate_rubric_dynamic(
+        scene,
+        history_messages,
+        agent_name,
+        ranker_model=ranker_model,
+        temperature=temperature,
+        base_url=base_url,
+        api_key=api_key,
+        baseline_weights_text=baseline_weights_text,
+    )
+    scores, scored_rubrics, reason = score_rubric_dynamic_with_reason(
+        scene,
+        history_messages,
+        agent_name,
+        current_response,
+        rubrics,
+        ranker_model=ranker_model,
+        temperature=temperature,
+        base_url=base_url,
+        api_key=api_key,
+    )
+    return scores, scored_rubrics, reason, llm_weights, weight_reasoning

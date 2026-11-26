@@ -437,6 +437,12 @@ def append_histories_with_rewards(
                 agent1 = agent_names[1] if len(agent_names) > 1 else ""
                 score = float(goal_scores_per_group[idx]) if idx < len(goal_scores_per_group) else None
                 reason = goal_reasons_per_group[idx] if idx < len(goal_reasons_per_group) else ""
+                reward_payload = {"goal_score": score, "goal_reason": reason}
+                if "process_rewards" in group:
+                    reward_payload["process_rewards"] = list(group["process_rewards"])
+                rubric_dynamic_per_turn = group.get("rubric_dynamic_per_turn") or []
+                if rubric_dynamic_per_turn:
+                    reward_payload["rubric_dynamic_per_turn"] = rubric_dynamic_per_turn
                 rec = {
                     "batch_idx": batch_idx,
                     "scene_idx": b,
@@ -450,10 +456,7 @@ def append_histories_with_rewards(
                     "agent0": agent0,
                     "agent1": agent1,
                     "history": histories_all,
-                    "reward": {
-                        "goal_score": score,
-                        "goal_reason": reason,
-                    },
+                    "reward": reward_payload,
                 }
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
             except Exception:
@@ -600,11 +603,7 @@ def apply_reply(
     reply: str,
 ) -> None:
     group = scene_groups[b][g]
-    # Snapshot history BEFORE appending the new reply, so turn_histories[i]
-    # captures the context that led to responses[i].
-    if not is_large_turn:
-        snapshot = [dict(m) for m in group["histories_all"][speaker]]
-        group["turn_histories"].append(snapshot)
+    # build_tasks already saved the pre-reply snapshot for each policy turn.
     for participant, history in group["histories_all"].items():
         role = "assistant" if participant == speaker else "user"
         history.append({"role": role, "content": reply})
@@ -830,11 +829,20 @@ def score_process_reward_item(
 
     extra = {
         "reward_kind": "rubric_dynamic",
+        "rubric_pipeline": "generate_then_score",
         "actor_role": actor_role,
         "family": family,
         "phase": phase,
         "dim_scores": {k: float(v) for k, v in dim_scores.items()},
+        "rubric_items": {
+            dim: [
+                {"item_id": item["item_id"], "criterion": item["criterion"]}
+                for item in items
+            ]
+            for dim, items in rubrics.items()
+        },
         "rubrics": rubrics,
+        "judge_reason": str(reason or ""),
         "baseline_weights": {k: float(v) for k, v in baseline_w.items()},
         "weights": {k: float(v) for k, v in used_w.items()},
         "weighted_score": float(weighted),
